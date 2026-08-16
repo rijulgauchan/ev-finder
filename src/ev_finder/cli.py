@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import typer
 
+from ev_finder.backtest.engine import (
+    DEFAULT_EDGE_THRESHOLD,
+    DEFAULT_KELLY_FRACTION,
+    run_backtest,
+)
 from ev_finder.config import ConfigError, load_settings, require_odds_api_key
 from ev_finder.db import get_connection, init_db
+from ev_finder.historical.fetch import HistoricalFetchError, download_season
+from ev_finder.historical.loader import load_dataframe, parse_csv
 from ev_finder.odds.client import DEFAULT_SPORT, OddsAPIClient, OddsAPIError
 from ev_finder.odds.storage import store_snapshot
 
@@ -53,6 +60,87 @@ def fetch_odds(
         f"({settings.db_path})",
         fg=typer.colors.GREEN,
     )
+
+
+def _parse_seasons(seasons: str) -> list[int]:
+    """Parse a "2019-2024" range into [2019, 2020, ..., 2024]."""
+    try:
+        start_str, end_str = seasons.split("-")
+        start, end = int(start_str), int(end_str)
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"--seasons must be START-END, e.g. 2019-2024 (got {seasons!r})"
+        ) from exc
+    if end < start:
+        raise typer.BadParameter(f"--seasons end ({end}) must be >= start ({start})")
+    return list(range(start, end + 1))
+
+
+@app.command("ingest-historical")
+def ingest_historical(
+    seasons: str = typer.Option(
+        "2019-2024", help="Season start-year range, e.g. 2019-2024 for 2019/20 through 2024/25."
+    ),
+) -> None:
+    """Download EPL results + closing odds from football-data.co.uk and store them."""
+    settings = load_settings()
+    start_years = _parse_seasons(seasons)
+
+    conn = get_connection(settings.db_path)
+    init_db(conn)
+    total_inserted = 0
+    try:
+        for start_year in start_years:
+            label = f"{start_year}/{(start_year + 1) % 100:02d}"
+            try:
+                csv_text = download_season(start_year)
+            except HistoricalFetchError as exc:
+                typer.secho(f"Skipping season {label}: {exc}", fg=typer.colors.RED)
+                continue
+
+            df = parse_csv(csv_text)
+            inserted = load_dataframe(conn, df)
+            total_inserted += inserted
+            typer.secho(
+                f"Season {label}: {len(df)} matches parsed, {inserted} new row(s) inserted.",
+                fg=typer.colors.GREEN,
+            )
+    finally:
+        conn.close()
+
+    typer.secho(f"Done. {total_inserted} new row(s) inserted in total.", fg=typer.colors.GREEN)
+
+
+@app.command("backtest")
+def backtest(
+    start: str = typer.Option(..., help="Start date, inclusive (YYYY-MM-DD)."),
+    end: str = typer.Option(..., help="End date, inclusive (YYYY-MM-DD)."),
+    edge_threshold: float = typer.Option(
+        DEFAULT_EDGE_THRESHOLD, help="Minimum model edge over vig-free market prob to flag a bet."
+    ),
+    kelly_fraction: float = typer.Option(
+        DEFAULT_KELLY_FRACTION, help="Fraction of full Kelly to stake on flagged bets."
+    ),
+) -> None:
+    """Walk-forward backtest the Dixon-Coles model against historical closing odds."""
+    settings = load_settings()
+    conn = get_connection(settings.db_path)
+    try:
+        init_db(conn)
+        summary = run_backtest(
+            conn, start=start, end=end, edge_threshold=edge_threshold, kelly_fraction=kelly_fraction
+        )
+    finally:
+        conn.close()
+
+    typer.secho(f"Backtest {start} -> {end} (edge>{edge_threshold}, kelly x{kelly_fraction})")
+    typer.echo(f"  Total bets:      {summary.total_bets}")
+    typer.echo(f"  ROI:             {summary.roi:.2%}")
+    typer.echo(f"  Hit rate:        {summary.hit_rate:.2%}")
+    for market, roi in summary.roi_by_market.items():
+        typer.echo(f"  ROI ({market}):{' ' * max(1, 6 - len(market))}{roi:.2%}")
+    typer.echo(f"  Max drawdown:    {summary.max_drawdown:.2f} units")
+    typer.echo(f"  Avg flagged edge:{summary.avg_edge:.2%}")
 
 
 @app.command("update-ratings")

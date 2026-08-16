@@ -31,6 +31,50 @@ CREATE TABLE IF NOT EXISTS odds_lines (
 
 CREATE INDEX IF NOT EXISTS idx_odds_lines_event ON odds_lines(event_id);
 CREATE INDEX IF NOT EXISTS idx_odds_lines_snapshot ON odds_lines(snapshot_id);
+
+CREATE TABLE IF NOT EXISTS historical_matches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    home_team TEXT NOT NULL,
+    away_team TEXT NOT NULL,
+    home_goals INTEGER NOT NULL,
+    away_goals INTEGER NOT NULL,
+    ftr TEXT NOT NULL,
+    b365_h REAL,
+    b365_d REAL,
+    b365_a REAL,
+    ps_h REAL,
+    ps_d REAL,
+    ps_a REAL,
+    avg_h REAL,
+    avg_d REAL,
+    avg_a REAL,
+    b365_over_2_5 REAL,
+    b365_under_2_5 REAL,
+    avg_over_2_5 REAL,
+    avg_under_2_5 REAL,
+    UNIQUE(date, home_team, away_team)
+);
+
+CREATE INDEX IF NOT EXISTS idx_historical_matches_date ON historical_matches(date);
+
+CREATE TABLE IF NOT EXISTS backtest_bets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,
+    home_team TEXT NOT NULL,
+    away_team TEXT NOT NULL,
+    market TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    model_prob REAL NOT NULL,
+    market_prob_no_vig REAL NOT NULL,
+    edge REAL NOT NULL,
+    kelly_stake REAL NOT NULL,
+    actual_result TEXT,
+    pnl_units REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_bets_date ON backtest_bets(date);
+CREATE INDEX IF NOT EXISTS idx_backtest_bets_market ON backtest_bets(market);
 """
 
 
