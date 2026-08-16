@@ -82,7 +82,7 @@ def ingest_historical(
         "2019-2024", help="Season start-year range, e.g. 2019-2024 for 2019/20 through 2024/25."
     ),
 ) -> None:
-    """Download EPL results + closing odds from football-data.co.uk and store them."""
+    """Download EPL results + pre-closing/closing odds from football-data.co.uk and store them."""
     settings = load_settings()
     start_years = _parse_seasons(seasons)
 
@@ -122,7 +122,8 @@ def backtest(
         DEFAULT_KELLY_FRACTION, help="Fraction of full Kelly to stake on flagged bets."
     ),
 ) -> None:
-    """Walk-forward backtest the Dixon-Coles model against historical closing odds."""
+    """Walk-forward backtest the Dixon-Coles model against pre-closing odds,
+    with true closing odds used only to score CLV on flagged bets."""
     settings = load_settings()
     conn = get_connection(settings.db_path)
     try:
@@ -141,6 +142,9 @@ def backtest(
         typer.echo(f"  ROI ({market}):{' ' * max(1, 6 - len(market))}{roi:.2%}")
     typer.echo(f"  Max drawdown:    {summary.max_drawdown:.2f} units")
     typer.echo(f"  Avg flagged edge:{summary.avg_edge:.2%}")
+    if summary.avg_clv_pct is not None:
+        typer.echo(f"  Avg CLV:         {summary.avg_clv_pct:+.2f}%")
+        typer.echo(f"  % bets w/ +CLV:  {summary.pct_positive_clv:.1%}")
 
 
 @app.command("update-ratings")

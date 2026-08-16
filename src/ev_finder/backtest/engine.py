@@ -1,5 +1,20 @@
 """Walk-forward backtest: refit Dixon-Coles per matchday, flag +EV bets
-against Bet365 closing odds, and log them to `backtest_bets`.
+against pre-closing Bet365 odds, and log them to `backtest_bets`.
+
+Note on "closing odds": football-data.co.uk's un-suffixed odds columns
+(B365H, B365>2.5, ...) are PRE-CLOSING -- an earlier snapshot, not the
+price at kickoff (see https://www.football-data.co.uk/notes.txt). True
+closing odds use a "C" suffix (B365CH, B365C>2.5, ...).
+
+The bet decision (whether to flag, how much to stake, PnL settlement) is
+driven ENTIRELY by the pre-closing price -- the true closing price is not
+known until kickoff, so benchmarking the decision against it would leak
+information from the future into a decision that, in reality, would have
+had to be made earlier. The true closing price is used *only* afterward,
+to compute CLV (closing-line value) as a diagnostic of whether the price
+taken was favorable relative to where the market ended up. CLV never
+feeds back into model_prob, market_prob_no_vig, edge, kelly_stake, or
+pnl_units.
 """
 
 from __future__ import annotations
@@ -32,6 +47,18 @@ def fractional_kelly_stake(
     return max(0.0, full_kelly) * kelly_fraction
 
 
+def clv_pct(bet_price: float, closing_reference_price: float) -> float:
+    """Closing-line value, as a percentage.
+
+    Positive means the price taken (pre-closing, i.e. `bet_price`) was more
+    favorable than where the line closed -- i.e. the market moved toward
+    agreeing with the bet after it would have been placed. This is purely a
+    diagnostic computed after the bet decision is already made; it never
+    feeds back into the decision itself.
+    """
+    return (bet_price / closing_reference_price - 1.0) * 100.0
+
+
 @dataclass
 class BacktestSummary:
     total_bets: int
@@ -40,6 +67,8 @@ class BacktestSummary:
     roi_by_market: dict[str, float]
     max_drawdown: float
     avg_edge: float
+    avg_clv_pct: float | None
+    pct_positive_clv: float | None
 
 
 def _actual_result_h2h(ftr: str) -> str:
@@ -53,24 +82,42 @@ def _actual_result_totals(home_goals: int, away_goals: int) -> str:
 def _evaluate_market(
     model_probs: dict[str, float],
     outcomes: list[str],
-    odds: list,
+    decision_odds: list,
+    closing_reference_odds: list,
     actual_result: str,
     market: str,
     edge_threshold: float,
     kelly_fraction: float,
 ) -> list[dict]:
-    """Compare model probs to vig-free market probs for one market; return
-    a row per outcome whose edge exceeds `edge_threshold`."""
+    """Compare model probs to vig-free pre-closing-line probs for one
+    market; return a row per outcome whose edge exceeds `edge_threshold`.
+
+    `decision_odds` (pre-closing) is the ONLY input that drives whether a
+    bet is flagged, how it's staked, and its settlement -- it's the price
+    that would actually have been available at decision time.
+    `closing_reference_odds` (true closing, same order as `outcomes`) is
+    used *only* to compute CLV as an after-the-fact diagnostic; it may be
+    missing even when `decision_odds` isn't, in which case the bet is still
+    flagged and logged, just with clv_pct left null. `closing_reference_odds`
+    never influences model_prob, market_prob_no_vig, edge, kelly_stake, or
+    pnl_units.
+    """
     # pandas.read_sql_query turns SQL NULLs into NaN for float columns (not
     # None), so both need checking -- and SQLite itself treats a bound NaN
     # as NULL for NOT NULL columns, so a stray NaN here would otherwise
-    # surface later as a confusing IntegrityError on insert.
-    if any(o is None or pd.isna(o) for o in odds):
-        return []  # odds missing for this market on this match -- skip it
+    # surface later as a confusing IntegrityError on insert. football-data
+    # .co.uk also sometimes encodes "missing" as a literal 0 instead of a
+    # blank cell (e.g. 2021-12-19 Newcastle vs Man City's closing totals),
+    # which isn't a valid decimal price either -- remove_vig would reject
+    # it, so it's treated the same as missing here.
+    if any(o is None or pd.isna(o) or o <= 1.0 for o in decision_odds):
+        return []  # decision odds missing/invalid for this market -- skip it
 
-    fair_probs = remove_vig(list(odds))
+    fair_probs = remove_vig(list(decision_odds))
     flagged = []
-    for outcome, market_prob, price in zip(outcomes, fair_probs, odds, strict=True):
+    for outcome, market_prob, price, close_ref in zip(
+        outcomes, fair_probs, decision_odds, closing_reference_odds, strict=True
+    ):
         model_prob = model_probs[outcome]
         edge = model_prob - market_prob
         if edge <= edge_threshold:
@@ -78,6 +125,8 @@ def _evaluate_market(
         stake = fractional_kelly_stake(model_prob, price, kelly_fraction)
         won = outcome == actual_result
         pnl = stake * (price - 1.0) if won else -stake
+
+        has_close_ref = close_ref is not None and not pd.isna(close_ref) and close_ref > 1.0
         flagged.append(
             {
                 "market": market,
@@ -88,6 +137,9 @@ def _evaluate_market(
                 "kelly_stake": stake,
                 "actual_result": actual_result,
                 "pnl_units": pnl,
+                "bet_price": price,
+                "closing_reference_price": close_ref if has_close_ref else None,
+                "clv_pct": clv_pct(price, close_ref) if has_close_ref else None,
             }
         )
     return flagged
@@ -105,11 +157,19 @@ def run_backtest(
     Refits the model once per unique fixture date on all matches strictly
     before that date (see DixonColesModel.fit's as_of_date semantics --
     this is what keeps the backtest leak-free), predicts every match on
-    that date, flags +EV bets against Bet365 closing odds, and (re)writes
-    them to `backtest_bets`. Re-running with the same [start, end] replaces
-    that range's rows rather than accumulating duplicates.
+    that date, flags +EV bets against pre-closing Bet365 odds (the price
+    that would have actually been available at decision time -- see this
+    module's docstring for why true closing odds are used only for CLV,
+    never for the decision), and (re)writes them to `backtest_bets`.
+    Re-running with the same [start, end] replaces that range's rows rather
+    than accumulating duplicates.
     """
-    matches = pd.read_sql_query("SELECT * FROM historical_matches ORDER BY date", conn)
+    # ORDER BY date, id: `id` is a deterministic tiebreak for same-date rows
+    # -- `ORDER BY date` alone doesn't guarantee a stable, reproducible tie
+    # order across SQLite query plans/runs, and that order flows through to
+    # backtest_bets' insertion order (see summarize()'s cumulative P&L,
+    # which is order-sensitive for max_drawdown).
+    matches = pd.read_sql_query("SELECT * FROM historical_matches ORDER BY date, id", conn)
     matches["date"] = pd.to_datetime(matches["date"])
     start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
 
@@ -140,6 +200,7 @@ def run_backtest(
                 probs,
                 ["home_win", "draw", "away_win"],
                 [row["b365_h"], row["b365_d"], row["b365_a"]],
+                [row["b365_close_h"], row["b365_close_d"], row["b365_close_a"]],
                 _actual_result_h2h(row["ftr"]),
                 "h2h",
                 edge_threshold,
@@ -149,6 +210,7 @@ def run_backtest(
                 probs,
                 ["over_2_5", "under_2_5"],
                 [row["b365_over_2_5"], row["b365_under_2_5"]],
+                [row["b365_close_over_2_5"], row["b365_close_under_2_5"]],
                 _actual_result_totals(row["home_goals"], row["away_goals"]),
                 "totals",
                 edge_threshold,
@@ -166,9 +228,11 @@ def run_backtest(
             """
             INSERT INTO backtest_bets
                 (date, home_team, away_team, market, outcome, model_prob,
-                 market_prob_no_vig, edge, kelly_stake, actual_result, pnl_units)
+                 market_prob_no_vig, edge, kelly_stake, actual_result, pnl_units,
+                 bet_price, closing_reference_price, clv_pct)
             VALUES (:date, :home_team, :away_team, :market, :outcome, :model_prob,
-                    :market_prob_no_vig, :edge, :kelly_stake, :actual_result, :pnl_units)
+                    :market_prob_no_vig, :edge, :kelly_stake, :actual_result, :pnl_units,
+                    :bet_price, :closing_reference_price, :clv_pct)
             """,
             all_rows,
         )
@@ -179,13 +243,20 @@ def run_backtest(
 
 def summarize(conn: sqlite3.Connection, start: str, end: str) -> BacktestSummary:
     df = pd.read_sql_query(
-        "SELECT * FROM backtest_bets WHERE date >= ? AND date <= ? ORDER BY date",
+        "SELECT * FROM backtest_bets WHERE date >= ? AND date <= ? ORDER BY date, id",
         conn,
         params=(start, end),
     )
     if df.empty:
         return BacktestSummary(
-            total_bets=0, roi=0.0, hit_rate=0.0, roi_by_market={}, max_drawdown=0.0, avg_edge=0.0
+            total_bets=0,
+            roi=0.0,
+            hit_rate=0.0,
+            roi_by_market={},
+            max_drawdown=0.0,
+            avg_edge=0.0,
+            avg_clv_pct=None,
+            pct_positive_clv=None,
         )
 
     total_staked = df["kelly_stake"].sum()
@@ -201,6 +272,10 @@ def summarize(conn: sqlite3.Connection, start: str, end: str) -> BacktestSummary
     cumulative = df["pnl_units"].cumsum()
     max_drawdown = (cumulative.cummax() - cumulative).max()
 
+    clv = df["clv_pct"].dropna()
+    avg_clv = float(clv.mean()) if len(clv) else None
+    pct_positive_clv = float((clv > 0).mean()) if len(clv) else None
+
     return BacktestSummary(
         total_bets=len(df),
         roi=roi,
@@ -208,4 +283,6 @@ def summarize(conn: sqlite3.Connection, start: str, end: str) -> BacktestSummary
         roi_by_market=roi_by_market,
         max_drawdown=max_drawdown,
         avg_edge=df["edge"].mean(),
+        avg_clv_pct=avg_clv,
+        pct_positive_clv=pct_positive_clv,
     )

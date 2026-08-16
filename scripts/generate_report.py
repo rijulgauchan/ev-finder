@@ -29,6 +29,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from ev_finder.backtest.engine import DEFAULT_KELLY_FRACTION, run_backtest  # noqa: E402
 from ev_finder.config import load_settings  # noqa: E402
+from ev_finder.db import init_db  # noqa: E402
 
 START = "2021-08-01"
 END = "2024-05-31"
@@ -56,13 +57,18 @@ plt.rcParams.update(
 
 
 def season_label(date: pd.Timestamp) -> str:
-    year = date.year if date.month >= 7 else date.year - 1
+    # month >= 8, not >= 7: the COVID-delayed 2019/20 season ran to
+    # 2020-07-26, and a >= 7 cutoff would misfile those July fixtures into
+    # "2020/21". EPL seasons never start in July, so an 8 cutoff is safe.
+    year = date.year if date.month >= 8 else date.year - 1
     return f"{year}/{(year + 1) % 100:02d}"
 
 
 def load_bets(conn: sqlite3.Connection) -> pd.DataFrame:
+    # ORDER BY date, id: deterministic tiebreak for same-date rows, matching
+    # engine.summarize()'s query -- see the comment there.
     df = pd.read_sql_query(
-        "SELECT * FROM backtest_bets WHERE date >= ? AND date <= ? ORDER BY date",
+        "SELECT * FROM backtest_bets WHERE date >= ? AND date <= ? ORDER BY date, id",
         conn,
         params=(START, END),
     )
@@ -72,7 +78,8 @@ def load_bets(conn: sqlite3.Connection) -> pd.DataFrame:
 
 
 def stats_table(df: pd.DataFrame, group_col: str | None) -> pd.DataFrame:
-    """total_bets, roi, hit_rate, max_drawdown -- overall or grouped by group_col."""
+    """total_bets, roi, hit_rate, max_drawdown, avg_clv_pct, pct_positive_clv
+    -- overall or grouped by group_col."""
     groups = [(None, df)] if group_col is None else list(df.groupby(group_col))
 
     rows = []
@@ -81,22 +88,33 @@ def stats_table(df: pd.DataFrame, group_col: str | None) -> pd.DataFrame:
         pnl = group["pnl_units"].sum()
         roi = pnl / staked if staked else 0.0
         hit_rate = (group["outcome"] == group["actual_result"]).mean()
-        cumulative = group.sort_values("date")["pnl_units"].cumsum()
+        # kind="stable": pandas' default quicksort isn't stable, and would
+        # otherwise reorder same-date ties arbitrarily -- shifting the
+        # intra-day cumulative trajectory and giving a max_drawdown that
+        # silently disagrees with engine.summarize()'s (which relies on the
+        # SQL ORDER BY date and never re-sorts). group is already date-order
+        # from load_bets()'s query; this re-sort is just a defensive no-op
+        # in the common case, made explicit and reproducible either way.
+        cumulative = group.sort_values("date", kind="stable")["pnl_units"].cumsum()
         max_dd = (cumulative.cummax() - cumulative).max() if len(cumulative) else 0.0
+        clv = group["clv_pct"].dropna()
         row = {
             "total_bets": len(group),
             "roi": roi,
             "hit_rate": hit_rate,
             "max_drawdown": max_dd,
+            "avg_clv_pct": float(clv.mean()) if len(clv) else 0.0,
+            "pct_positive_clv": float((clv > 0).mean()) if len(clv) else 0.0,
         }
         if key is not None:
             row[group_col] = key
         rows.append(row)
 
     out = pd.DataFrame(rows)
+    cols = ["total_bets", "roi", "hit_rate", "max_drawdown", "avg_clv_pct", "pct_positive_clv"]
     if group_col is not None:
-        out = out[[group_col, "total_bets", "roi", "hit_rate", "max_drawdown"]]
-    return out
+        cols = [group_col, *cols]
+    return out[cols]
 
 
 def to_markdown_table(df: pd.DataFrame, headers: list[str]) -> str:
@@ -115,6 +133,10 @@ def to_markdown_table(df: pd.DataFrame, headers: list[str]) -> str:
                 cells.append(f"{val:.1%}")
             elif col == "max_drawdown":
                 cells.append(f"{val:.2f}")
+            elif col == "avg_clv_pct":
+                cells.append(f"{val:+.2f}%")
+            elif col == "pct_positive_clv":
+                cells.append(f"{val:.1%}")
             elif col == "total_bets":
                 cells.append(str(int(val)))
             else:
@@ -160,8 +182,18 @@ def main() -> None:
     settings = load_settings()
     conn = sqlite3.connect(settings.db_path)
     conn.row_factory = sqlite3.Row
+    # Idempotent (CREATE TABLE IF NOT EXISTS): makes this script runnable
+    # standalone against a fresh DB, and self-healing after a schema-change
+    # migration that dropped backtest_bets (as happened during Phase 2).
+    init_db(conn)
 
     ASSETS_DIR.mkdir(exist_ok=True)
+
+    if conn.execute("SELECT COUNT(*) FROM historical_matches").fetchone()[0] == 0:
+        raise SystemExit(
+            "historical_matches is empty -- run "
+            "`uv run ev-finder ingest-historical --seasons 2019-2024` first."
+        )
 
     # 1. Default-threshold run: source for the headline numbers, the
     #    cumulative P&L chart, and the by-season / by-market tables.
@@ -185,6 +217,10 @@ def main() -> None:
                 "roi": summary.roi,
                 "hit_rate": summary.hit_rate,
                 "max_drawdown": summary.max_drawdown,
+                "avg_clv_pct": summary.avg_clv_pct if summary.avg_clv_pct is not None else 0.0,
+                "pct_positive_clv": (
+                    summary.pct_positive_clv if summary.pct_positive_clv is not None else 0.0
+                ),
             }
         )
     sweep_df = pd.DataFrame(sweep_rows)
@@ -200,30 +236,44 @@ def main() -> None:
     conn.close()
 
     # 4. Write RESULTS.md.
+    metric_headers = [
+        "total_bets",
+        "roi",
+        "hit_rate",
+        "max_drawdown",
+        "avg_clv",
+        "pct_positive_clv",
+    ]
     lines = [
         "# Results",
         "",
-        f"Walk-forward backtest, {START} to {END}, Bet365 closing odds, "
-        f"quarter Kelly staking (fraction={DEFAULT_KELLY_FRACTION}).",
+        f"Walk-forward backtest, {START} to {END}, Bet365 pre-closing odds "
+        "(the price realistically available at decision time -- see README Method), "
+        f"quarter Kelly staking (fraction={DEFAULT_KELLY_FRACTION}). "
+        "All measured quantities below (bet counts, ROI, hit rate, max drawdown, CLV) come "
+        "directly from this backtest run; any interpretation of what they mean is in README.md, "
+        "not here.\n\n"
+        "CLV = closing-line value: `(bet_price / true_closing_price - 1) * 100`, where "
+        "bet_price is the pre-closing price the bet was actually decided and staked on, and "
+        'true_closing_price (Bet365\'s "C"-suffixed columns) is used *only* for this '
+        "diagnostic, never for the bet decision itself. Computed only for bets where "
+        "football-data.co.uk has both snapshots (all bets in this backtest window have both).",
         "",
         "## Overall (edge threshold > 3%)",
         "",
-        to_markdown_table(overall, ["total_bets", "roi", "hit_rate", "max_drawdown"]),
+        to_markdown_table(overall, metric_headers),
         "",
         "## By season (edge threshold > 3%)",
         "",
-        to_markdown_table(by_season, ["season", "total_bets", "roi", "hit_rate", "max_drawdown"]),
+        to_markdown_table(by_season, ["season", *metric_headers]),
         "",
         "## By market (edge threshold > 3%)",
         "",
-        to_markdown_table(by_market, ["market", "total_bets", "roi", "hit_rate", "max_drawdown"]),
+        to_markdown_table(by_market, ["market", *metric_headers]),
         "",
         "## By edge threshold",
         "",
-        to_markdown_table(
-            sweep_display,
-            ["edge_threshold_pct", "total_bets", "roi", "hit_rate", "max_drawdown"],
-        ),
+        to_markdown_table(sweep_display, ["edge_threshold_pct", *metric_headers]),
         "",
     ]
     RESULTS_PATH.write_text("\n".join(lines))

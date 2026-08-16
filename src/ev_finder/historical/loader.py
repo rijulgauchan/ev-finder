@@ -10,6 +10,14 @@ import pandas as pd
 # Maps our column names to the source CSV's column names. Some older seasons
 # may be missing a column (e.g. an odds field) -- those are treated as NULL
 # rather than failing the whole load.
+#
+# football-data.co.uk's un-suffixed odds columns (B365H, PSH, Avg>2.5, ...)
+# are PRE-CLOSING odds -- an earlier snapshot, not the price at kickoff.
+# True closing odds use a "C" suffix (B365CH, PSCH, AvgC>2.5, ...). See
+# https://www.football-data.co.uk/notes.txt. Both are ingested: pre-closing
+# is what the backtest's bet decision (edge, staking, settlement) is driven
+# by -- it's the price actually available at decision time -- while closing
+# is used only afterward, as the CLV reference point.
 COLUMN_MAP = {
     "date": "Date",
     "home_team": "HomeTeam",
@@ -30,6 +38,19 @@ COLUMN_MAP = {
     "b365_under_2_5": "B365<2.5",
     "avg_over_2_5": "Avg>2.5",
     "avg_under_2_5": "Avg<2.5",
+    "b365_close_h": "B365CH",
+    "b365_close_d": "B365CD",
+    "b365_close_a": "B365CA",
+    "ps_close_h": "PSCH",
+    "ps_close_d": "PSCD",
+    "ps_close_a": "PSCA",
+    "avg_close_h": "AvgCH",
+    "avg_close_d": "AvgCD",
+    "avg_close_a": "AvgCA",
+    "b365_close_over_2_5": "B365C>2.5",
+    "b365_close_under_2_5": "B365C<2.5",
+    "avg_close_over_2_5": "AvgC>2.5",
+    "avg_close_under_2_5": "AvgC<2.5",
 }
 
 REQUIRED_COLUMNS = ["date", "home_team", "away_team", "home_goals", "away_goals", "ftr"]

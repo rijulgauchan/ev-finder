@@ -40,6 +40,9 @@ CREATE TABLE IF NOT EXISTS historical_matches (
     home_goals INTEGER NOT NULL,
     away_goals INTEGER NOT NULL,
     ftr TEXT NOT NULL,
+    -- Pre-closing odds (football-data.co.uk's un-suffixed columns -- an
+    -- earlier snapshot, NOT the price at kickoff, despite the confusing
+    -- naming). Useful as "the price you could realistically have bet at."
     b365_h REAL,
     b365_d REAL,
     b365_a REAL,
@@ -53,6 +56,23 @@ CREATE TABLE IF NOT EXISTS historical_matches (
     b365_under_2_5 REAL,
     avg_over_2_5 REAL,
     avg_under_2_5 REAL,
+    -- True closing odds (football-data.co.uk's "C"-suffixed columns,
+    -- e.g. B365CH), captured at kickoff. The backtest's bet decision does
+    -- NOT use these -- see backtest_bets.closing_reference_price below --
+    -- they're only a post-hoc CLV reference.
+    b365_close_h REAL,
+    b365_close_d REAL,
+    b365_close_a REAL,
+    ps_close_h REAL,
+    ps_close_d REAL,
+    ps_close_a REAL,
+    avg_close_h REAL,
+    avg_close_d REAL,
+    avg_close_a REAL,
+    b365_close_over_2_5 REAL,
+    b365_close_under_2_5 REAL,
+    avg_close_over_2_5 REAL,
+    avg_close_under_2_5 REAL,
     UNIQUE(date, home_team, away_team)
 );
 
@@ -70,7 +90,19 @@ CREATE TABLE IF NOT EXISTS backtest_bets (
     edge REAL NOT NULL,
     kelly_stake REAL NOT NULL,
     actual_result TEXT,
-    pnl_units REAL
+    pnl_units REAL,
+    -- bet_price is the PRE-CLOSING odds the bet decision is flagged, sized,
+    -- and settled against -- the true closing price isn't known until
+    -- kickoff, so it cannot be what a bet is decided or staked on without
+    -- leaking future information into the decision. closing_reference_price
+    -- is the true closing price, used *only* after the fact to compute CLV
+    -- (how the price taken compares to where the line ended up); it never
+    -- feeds back into model_prob, market_prob_no_vig, edge, kelly_stake, or
+    -- pnl_units. Both nullable since not every historical row has both
+    -- snapshots.
+    bet_price REAL,
+    closing_reference_price REAL,
+    clv_pct REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_backtest_bets_date ON backtest_bets(date);
