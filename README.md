@@ -41,11 +41,13 @@ Split by market, it's worse on 1X2 (-9.07% ROI, 955 bets) than on totals (-5.00%
 
 **CLV.** Across the same 1,821 bets, average CLV is **+0.51%** — the pre-closing prices taken were, on average, very slightly better than where those lines closed. But only **42.1%** of individual bets had positive CLV. Those two numbers together are a genuinely mixed signal, not a hidden win dressed up as a loss: a minority of bets moved favorably, apparently by more than the majority moved unfavorably, which is enough to pull the mean above zero without it representing a repeatable edge. CLV was positive on average in 2021/22 (+0.67%) and 2022/23 (+0.86%) but roughly flat in 2023/24 (-0.03%), and slightly higher on 1X2 (+0.84%) than totals (+0.14%) — the opposite ranking from ROI, where totals was the *less bad* market. Full breakdowns — by season, by market, by edge threshold — are in [RESULTS.md](RESULTS.md), which contains only the measured numbers; everything evaluative is here.
 
-My honest read: this is roughly what a naive model should look like against a reasonably efficient market, not a bug to chase. Bet365's pre-closing price already incorporates recent results, home advantage, and goal-scoring correlation — everything my model uses — plus everything it doesn't (injuries, lineup news, weather, money flow). Beating it outright with a Poisson model and public results data alone would be the surprising outcome. The CLV numbers don't rescue that conclusion: they're too weak and too inconsistent (barely positive on average, negative for most individual bets) to read as evidence of real skill. The more useful questions are downstream of accepting that: whether softer books post worse pre-closing lines than Bet365 that a legitimate signal could clear, and whether specific markets or situations — not the aggregate — hide a real edge.
+My honest read: this is roughly what a naive model should look like against a reasonably efficient market, not a bug to chase. Bet365's pre-closing price already incorporates recent results, home advantage, and goal-scoring correlation — everything my model uses — plus everything it doesn't (injuries, lineup news, weather, money flow). Beating it outright with a Poisson model and public results data alone would be the surprising outcome. The CLV numbers don't rescue that conclusion: they're too weak and too inconsistent (barely positive on average, negative for most individual bets) to read as evidence of real skill.
+
+**Is Bet365 specifically the problem?** No. I re-ran the identical backtest against Pinnacle (the other benchmark-sharp book) and the market average, using each book's own pre-closing price to drive the decision and its own closing price for CLV — same methodology, different bookmaker. Every book, every market, was negative: Pinnacle's h2h was the least bad at -6.58%, still solidly unprofitable, and in the same range as the season-to-season and threshold-to-threshold noise already seen against Bet365. The market average didn't do any better. Full table in [RESULTS.md](RESULTS.md). That closes off the most obvious "maybe it's just this one sharp book" explanation — the negative result isn't a Bet365 artifact, and the remaining open question is whether specific markets or situations, not the aggregate, hide a real edge.
 
 ## Next steps
 
-- **Multi-book comparison.** The backtest only checks Bet365, one of the sharpest books. Comparing model probabilities against softer European/Asian books' pre-closing lines would test whether the edge (if any) is bookmaker-specific rather than nonexistent.
+- ~~Multi-book comparison.~~ **Done, closed.** Bet365, Pinnacle, and the market average all show negative ROI across both markets (see Findings above and [RESULTS.md](RESULTS.md)) — the negative result isn't specific to one sharp book.
 - **Over/under 2.5, specifically.** It underperformed 1X2 here, which is itself worth understanding rather than shrugging off — is the Poisson goal-count assumption too rigid, is `rho` mis-calibrated for the totals market, or is there a staking/threshold interaction I haven't isolated?
 - **The CLV/ROI split by market.** 1X2 had worse ROI but better average CLV than totals — worth digging into whether that's noise or a real difference in how those two markets move between pre-closing and closing.
 - **`find-value` stays unwired.** Given these results, wiring the model into live betting recommendations isn't justified yet. That's a deliberate scope decision, not a missing feature.
@@ -65,11 +67,12 @@ src/ev_finder/
 └── config.py         # .env / settings loading
 
 scripts/
-└── generate_report.py  # regenerates RESULTS.md and the two charts above
+├── generate_report.py       # regenerates RESULTS.md and the two charts above
+└── multibook_experiment.py  # multi-book comparison (Bet365/Pinnacle/average), appends to RESULTS.md
 
 tests/                # pytest: vig math, Dixon-Coles fit/tau, Kelly staking, no-leak guarantees
 assets/               # charts embedded in this README
-RESULTS.md            # full numeric breakdown (by season, market, threshold) -- measured only
+RESULTS.md            # full numeric breakdown (by season, market, threshold, book) -- measured only
 ```
 
 ## Setup
@@ -94,6 +97,7 @@ To reproduce everything in this README and in [RESULTS.md](RESULTS.md) from scra
 ```bash
 uv run ev-finder ingest-historical --seasons 2019-2024
 uv run python scripts/generate_report.py
+uv run python scripts/multibook_experiment.py   # multi-book comparison section
 ```
 
 The report script re-runs the backtest at the default 3% edge threshold plus a 1/2/3/5/7/10% sweep (~10-15 minutes total; it refits the model once per matchday) and regenerates `RESULTS.md`, `assets/cumulative_pnl.png`, and `assets/roi_by_threshold.png` from whatever's in the database at the end.

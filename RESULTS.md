@@ -35,3 +35,16 @@ CLV = closing-line value: `(bet_price / true_closing_price - 1) * 100`, where be
 | 5% | 1392 | -7.46% | 44.3% | 4.75 | +0.41% | 41.7% |
 | 7% | 1060 | -6.37% | 44.6% | 3.72 | +0.37% | 42.3% |
 | 10% | 636 | -5.21% | 45.6% | 2.56 | +0.46% | 43.7% |
+
+## Multi-book comparison (edge threshold > 3%)
+
+Same walk-forward methodology as the rest of this document (pre-closing decision, closing-only CLV), re-run against each book's own pre-closing/closing odds instead of always Bet365's. Pinnacle totals odds were never ingested (not available in the source data), hence "no data" there.
+
+| book | market | total_bets | roi | hit_rate | max_drawdown | avg_clv | pct_positive_clv |
+|---|---|---|---|---|---|---|---|
+| bet365 | h2h | 955 | -9.07% | 37.0% | 2.79 | +0.84% | 43.8% |
+| bet365 | totals | 866 | -5.00% | 52.3% | 2.30 | +0.14% | 40.2% |
+| pinnacle | h2h | 943 | -6.58% | 36.2% | 2.30 | +0.07% | 47.0% |
+| pinnacle | totals | - | - | - | - | - | - |
+| average | h2h | 939 | -7.69% | 36.7% | 2.53 | -0.27% | 46.0% |
+| average | totals | 854 | -4.89% | 52.2% | 2.26 | -0.15% | 47.2% |
